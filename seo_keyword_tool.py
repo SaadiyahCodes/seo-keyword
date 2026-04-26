@@ -22,28 +22,30 @@ if 'blog_type' not in st.session_state:
 
 def process_gkp_csv(csv_file):
     """Process GKP CSV: skip first 2 rows, extract Keyword & Volume columns"""
+    # GKP exports are UTF-16 encoded with tab separators
     df = pd.read_csv(
         csv_file,
         encoding="utf-16",
         sep="\t",
         skiprows=2
     )
-     # Clean column names (remove BOM and whitespace)
+    
+    # Clean column names (remove BOM and whitespace)
     df.columns = (
         df.columns
         .str.strip()
         .str.lower()
         .str.replace("\ufeff", "", regex=True)
     )
-    # Extract only relevant columns (A: Keyword, C: Volume)
-    # GKP export typically has: Keyword, Currency, Avg. monthly searches, ...
+    
     # Find the correct columns dynamically
     keyword_col = [c for c in df.columns if "keyword" in c][0]
     volume_col = [c for c in df.columns if "avg" in c or "search" in c][0]
-
+    
+    # Extract only relevant columns
     df_clean = df[[keyword_col, volume_col]].copy()
     df_clean.columns = ['Keyword', 'Volume']
-
+    
     # Clean keywords
     df_clean['Keyword'] = df_clean['Keyword'].astype(str).str.strip()
     
@@ -76,9 +78,9 @@ def connect_to_gsheet(credentials_dict, sheet_url):
 def update_unfiltered_tab(sheet, df):
     """Update the Unfiltered Keyword List tab"""
     try:
-        worksheet = sheet.worksheet("Unfiltered Keyword List")
+        worksheet = sheet.worksheet("UnfilteredKeywords")
     except:
-        worksheet = sheet.add_worksheet(title="Unfiltered Keyword List", rows=len(df)+10, cols=3)
+        worksheet = sheet.add_worksheet(title="UnfilteredKeywords", rows=len(df)+10, cols=3)
     
     # Clear existing content
     worksheet.clear()
@@ -90,9 +92,10 @@ def update_unfiltered_tab(sheet, df):
     data = df[['Keyword', 'Volume']].values.tolist()
     worksheet.update(f'A2:B{len(data)+1}', data)
     
-    # Add Match formula for each row
-    for i in range(2, len(data) + 2):
-        worksheet.update(f'C{i}', f'=COUNTIF(Layers!B:B, A{i})')
+    # Add Match formula for all rows at once
+    if len(data) > 0:
+        match_formulas = [[f'=COUNTIF(Layers!B:B,A{i})'] for i in range(2, len(data) + 2)]
+        worksheet.update(range_name=f'C2:C{len(data)+1}', values=match_formulas, value_input_option='USER_ENTERED')
     
     return True
 
@@ -118,33 +121,35 @@ def create_layering_tab(sheet, clusters_dict, unfiltered_df):
     
     # Process each cluster
     for cluster_name, keywords in clusters_dict.items():
-        # Add cluster header row
-        worksheet.update(f'A{current_row}', cluster_name)
+        # Prepare cluster data (header + keywords + formulas)
+        cluster_data = []
+        
+        # Cluster header row
+        cluster_data.append([cluster_name, '', '', '', '', ''])
+        
+        # Keyword rows with VLOOKUP formulas
+        for keyword in keywords:
+            cluster_data.append(['', keyword, f'=VLOOKUP(B{current_row+1},UnfilteredKeywords!A:B,2,FALSE)', '', '', ''])
+            current_row += 1
+        
+        # Write entire cluster at once
+        start_row = current_row - len(keywords)
+        worksheet.update(range_name=f'A{start_row}:F{current_row}', values=cluster_data, value_input_option='USER_ENTERED')
         
         # Format cluster header
-        worksheet.format(f'A{current_row}:F{current_row}', {
+        worksheet.format(f'A{start_row}:F{start_row}', {
             'textFormat': {'bold': True},
             'backgroundColor': {'red': 0.85, 'green': 0.92, 'blue': 0.95}
         })
         
-        current_row += 1
-        
-        # Add keywords for this cluster
-        for keyword in keywords:
-            worksheet.update(f'B{current_row}', keyword)
-            
-            # Add VLOOKUP formula for volume
-            worksheet.update(f'C{current_row}', f'=VLOOKUP(B{current_row},"Unfiltered Keyword List"!A:B,2,FALSE)')
-            
-            current_row += 1
-        
         # Add visual separator (border) after each cluster
-        if current_row > 2:
-            worksheet.format(f'A{current_row-1}:F{current_row-1}', {
-                'borders': {
-                    'bottom': {'style': 'SOLID_MEDIUM', 'color': {'red': 0, 'green': 0, 'blue': 0}}
-                }
-            })
+        worksheet.format(f'A{current_row}:F{current_row}', {
+            'borders': {
+                'bottom': {'style': 'SOLID_MEDIUM', 'color': {'red': 0, 'green': 0, 'blue': 0}}
+            }
+        })
+        
+        current_row += 1
     
     return True
 
@@ -183,17 +188,28 @@ if st.session_state.step >= 1:
         with st.expander("🔧 Google Sheets Setup (Optional - for auto-sync)"):
             st.info("To enable automatic Google Sheets sync, you'll need to upload your service account credentials JSON file.")
             
-            creds_file = st.file_uploader("Upload Service Account JSON", type=['json'], key='creds')
+            creds_file = st.file_uploader("Upload Service Account JSON", type=['json'], key='creds_upload')
             sheet_url = st.text_input("Google Sheet URL", placeholder="https://docs.google.com/spreadsheets/d/...")
             
             if creds_file and sheet_url:
-                st.session_state.creds = json.load(creds_file)
-                st.session_state.sheet_url = sheet_url
+                try:
+                    # Read file content only when file changes
+                    creds_data = json.load(creds_file)
+                    st.session_state.gsheet_creds = creds_data
+                    st.session_state.sheet_url = sheet_url
+                    st.success("✅ Google Sheets configured!")
+                except Exception as e:
+                    st.error(f"Error loading credentials: {e}")
     
-    if st.session_state.keywords_df is not None and st.session_state.topic:
-        if st.button("Continue to AI Clustering →", type="primary"):
-            st.session_state.step = 2
-            st.rerun()
+    # Show button always but disable if requirements not met
+    button_disabled = st.session_state.keywords_df is None or not st.session_state.topic
+    
+    if button_disabled:
+        st.warning("⚠️ Please upload a CSV file and enter a topic to continue")
+    
+    if st.button("Continue to AI Clustering →", type="primary", disabled=button_disabled):
+        st.session_state.step = 2
+        st.rerun()
 
 # Step 2: AI Clustering (Human Intervention)
 if st.session_state.step >= 2:
@@ -203,11 +219,24 @@ if st.session_state.step >= 2:
     # Generate the prompt
     brand_clause = f"besides {st.session_state.brand_name}" if st.session_state.blog_type == "brand blog" and st.session_state.brand_name else ""
     
-    chatgpt_prompt = f"""You are an SEO expert for a discount savings startup in UAE doing keyword search. 
-    Group these keywords into 6-8 sub-intent layers which identify the main problems or user pain points which will form our content outline or be covered to enrich the outline. 
-    Use short, clear cluster or sub-intent layer names (2–5 words max). Return the cluster names with the exact keyword names. 
-    Ignore irrelevant keywords which contain brand names [{brand_clause if brand_clause else "not applicable"}] and other irrelevant intent keywords.
-    This is the topic it has to be relevant to: {st.session_state.topic}
+    chatgpt_prompt = f"""You are an SEO expert for a discount savings startup in UAE doing keyword search. Group these keywords into 6-8 sub-intent layers which identify the main problems or user pain points which will form our content outline or be covered to enrich the outline. 
+
+Use short, clear cluster or sub-intent layer names (2–5 words max). Return the cluster names with the exact keyword names. 
+
+FILTER OUT these low-value keywords:
+- Time-based variants (7 day, 30 day, weekly, monthly, etc.) unless the time period is the core intent
+- Generic location modifiers (near me, in my area, etc.)
+- Ultra-specific brand combinations that aren't relevant
+- Keywords with brand names [{brand_clause if brand_clause else "not applicable"}]
+- Other irrelevant intent keywords
+
+KEEP high-value keywords that represent:
+- Core user problems or pain points
+- Specific dietary needs or health conditions
+- Product features or service types
+- Clear purchase or research intent
+
+This is the topic it has to be relevant to: {st.session_state.topic}
 
 Keywords to cluster:
 {', '.join(st.session_state.keywords_df['Keyword'].tolist())}
@@ -221,8 +250,8 @@ Return ONLY a JSON object in this format (no markdown, no explanation):
     st.subheader("📋 Copy this prompt to ChatGPT:")
     st.code(chatgpt_prompt, language=None)
     
-    if st.button("📋 Copy Prompt to Clipboard"):
-        st.write("Prompt ready to copy!")
+    # Use a text area for easy copying
+    st.text_area("Click in the box and Ctrl+A, Ctrl+C to copy:", chatgpt_prompt, height=100, key="prompt_copy")
     
     st.markdown("---")
     st.subheader("📥 Paste ChatGPT's Response Here:")
@@ -244,12 +273,20 @@ Return ONLY a JSON object in this format (no markdown, no explanation):
             
             st.session_state.clusters = clusters
             
-            if st.button("Generate Layering Tab →", type="primary"):
-                st.session_state.step = 3
-                st.rerun()
-                
         except json.JSONDecodeError as e:
             st.error(f"Invalid JSON format. Please make sure ChatGPT returned valid JSON. Error: {e}")
+    
+    # Show button always but disable if no valid JSON parsed
+    generate_disabled = not chatgpt_response or 'clusters' not in st.session_state
+    
+    if generate_disabled and chatgpt_response:
+        st.warning("⚠️ Please paste valid JSON from ChatGPT above")
+    elif generate_disabled:
+        st.info("💡 Paste ChatGPT's JSON response above to continue")
+    
+    if st.button("Generate Layering Tab →", type="primary", disabled=generate_disabled):
+        st.session_state.step = 3
+        st.rerun()
 
 # Step 3: Generate Final Output
 if st.session_state.step >= 3:
@@ -314,12 +351,12 @@ if st.session_state.step >= 3:
             )
         
         # Sync to Google Sheets
-        if hasattr(st.session_state, 'creds') and hasattr(st.session_state, 'sheet_url'):
+        if hasattr(st.session_state, 'gsheet_creds') and hasattr(st.session_state, 'sheet_url'):
             st.markdown("---")
             if st.button("🔄 Sync to Google Sheets", type="primary"):
                 with st.spinner("Syncing to Google Sheets..."):
                     try:
-                        sheet = connect_to_gsheet(st.session_state.creds, st.session_state.sheet_url)
+                        sheet = connect_to_gsheet(st.session_state.gsheet_creds, st.session_state.sheet_url)
                         
                         # Update Unfiltered tab
                         update_unfiltered_tab(sheet, st.session_state.keywords_df)
