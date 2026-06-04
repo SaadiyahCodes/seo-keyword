@@ -7,7 +7,7 @@ __pycache__/
 env/
 venv/
 ENV/
-.env/
+.env
 
 # Streamlit
 .streamlit/
